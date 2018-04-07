@@ -44,6 +44,7 @@ class DCGAN(object):
     self.output_height = output_height
     self.output_width = output_width
 
+    self.text_embedding_dim = 128
     self.y_dim = y_dim
     self.z_dim = z_dim
 
@@ -70,13 +71,20 @@ class DCGAN(object):
     self.dataset_name = dataset_name
     self.input_fname_pattern = input_fname_pattern
     self.checkpoint_dir = checkpoint_dir
-
     if(self.dataset_name == 'birds'):
 	pickle_in_1 = open("./Dataset/birds/train/76images.pickle","rb")
     	self.data = pickle.load(pickle_in_1)
+	pickle_in_2 = open("./Dataset/birds/train/char-CNN-RNN-embeddings-Reduced.pickle","rb")
+	self.text_embedding = np.array(pickle.load(pickle_in_2))
+	shape = self.text_embedding.shape
+	self.text_embedding = np.reshape(self.text_embedding,(shape[0],shape[1],shape[2]))
     else:
 	pickle_in_1 = open("./Dataset/flowers/train/76images.pickle","rb")
 	self.data = pickle.load(pickle_in_1)
+	pickle_in_2 = open("./Dataset/flowers/train/char-CNN-RNN-embeddings-Reduced.pickle","rb")
+	self.text_embedding = np.array(pickle.load(pickle_in_2))
+	shape = self.text_embedding.shape
+	self.text_embedding = np.reshape(self.text_embedding,(shape[0],shape[1],shape[2]))
     
     if len(self.data[0].shape) >= 3: #check if image is a non-grayscale image by checking channel number
         self.c_dim = self.data[0].shape[-1]
@@ -104,13 +112,15 @@ class DCGAN(object):
     inputs = self.inputs
 
     self.z = tf.placeholder(
-      tf.float32, [None, self.z_dim], name='z')
+      tf.float32, [None, self.z_dim+self.text_embedding_dim], name='z')
     self.z_sum = histogram_summary("z", self.z)
 
+    self.mod_z = tf.placeholder(tf.float32,[None,4,4,self.text_embedding_dim], name='mod_z')
+
     self.G                  = self.generator(self.z, self.y)
-    self.D, self.D_logits   = self.discriminator(inputs, self.y, reuse=False)
+    self.D, self.D_logits   = self.discriminator(inputs, self.y,self.mod_z, reuse=False)
     self.sampler            = self.sampler(self.z, self.y)
-    self.D_, self.D_logits_ = self.discriminator(self.G, self.y, reuse=True)
+    self.D_, self.D_logits_ = self.discriminator(self.G, self.y,self.mod_z, reuse=True)
     
     self.d_sum = histogram_summary("d", self.D)
     self.d__sum = histogram_summary("d_", self.D_)
@@ -161,6 +171,9 @@ class DCGAN(object):
     self.writer = SummaryWriter("./logs", self.sess.graph)
 
     sample_z = np.random.uniform(-1, 1, size=(self.sample_num , self.z_dim))
+    text_embedding = load_text_embedding(config,self.text_embedding,0)
+    sample_z = np.concatenate((sample_z,text_embedding),axis=1)
+    sample_mod_z = reshape(text_embedding,4,4).astype(np.float32)
     
     if config.dataset == 'mnist':
       sample_inputs = self.data_X[0:self.sample_num]
@@ -218,12 +231,18 @@ class DCGAN(object):
 
         batch_z = np.random.uniform(-1, 1, [config.batch_size, self.z_dim]) \
               .astype(np.float32)
+	text_embedding = load_text_embedding(config,self.text_embedding,idx)
+	batch_z = np.concatenate((batch_z,text_embedding),axis=1)
+
+	batch_mod_z = reshape(text_embedding,4,4).astype(np.float32)
+
         if config.dataset == 'mnist':
           # Update D network
           _, summary_str = self.sess.run([d_optim, self.d_sum],
             feed_dict={ 
               self.inputs: batch_images,
               self.z: batch_z,
+	      self.mod_z: batch_mod_z,
               self.y:batch_labels,
             })
           self.writer.add_summary(summary_str, counter)
@@ -256,22 +275,22 @@ class DCGAN(object):
         else:
           # Update D network
           _, summary_str = self.sess.run([d_optim, self.d_sum],
-            feed_dict={ self.inputs: batch_images, self.z: batch_z })
+            feed_dict={ self.inputs: batch_images, self.z: batch_z, self.mod_z: batch_mod_z })
           self.writer.add_summary(summary_str, counter)
 
           # Update G network
           _, summary_str = self.sess.run([g_optim, self.g_sum],
-            feed_dict={ self.z: batch_z })
+            feed_dict={ self.z: batch_z, self.mod_z:batch_mod_z })
           self.writer.add_summary(summary_str, counter)
 
           # Run g_optim twice to make sure that d_loss does not go to zero (different from paper)
           _, summary_str = self.sess.run([g_optim, self.g_sum],
-            feed_dict={ self.z: batch_z })
+            feed_dict={ self.z: batch_z, self.mod_z: batch_mod_z })
           self.writer.add_summary(summary_str, counter)
           
-          errD_fake = self.d_loss_fake.eval({ self.z: batch_z })
-          errD_real = self.d_loss_real.eval({ self.inputs: batch_images })
-          errG = self.g_loss.eval({self.z: batch_z})
+          errD_fake = self.d_loss_fake.eval({ self.z: batch_z, self.mod_z: batch_mod_z })
+          errD_real = self.d_loss_real.eval({ self.inputs: batch_images, self.mod_z: batch_mod_z })
+          errG = self.g_loss.eval({self.z: batch_z, self.mod_z: batch_mod_z})
 
         counter += 1
         print("Epoch: [%2d] [%4d/%4d] time: %4.4f, d_loss: %.8f, g_loss: %.8f" \
@@ -297,6 +316,7 @@ class DCGAN(object):
                 [self.sampler, self.d_loss, self.g_loss],
                 feed_dict={
                     self.z: sample_z,
+		    self.mod_z: sample_mod_z,
                     self.inputs: sample_inputs,
                 },
               )
@@ -309,7 +329,7 @@ class DCGAN(object):
         if np.mod(counter, 500) == 2:
           self.save(config.checkpoint_dir, counter)
 
-  def discriminator(self, image, y=None, reuse=False):
+  def discriminator(self, image, y=None, z=None, reuse=False):
     with tf.variable_scope("discriminator") as scope:
       if reuse:
         scope.reuse_variables()
@@ -319,7 +339,8 @@ class DCGAN(object):
         h1 = lrelu(self.d_bn1(conv2d(h0, self.df_dim*2, name='d_h1_conv')))
         h2 = lrelu(self.d_bn2(conv2d(h1, self.df_dim*4, name='d_h2_conv')))
         h3 = lrelu(self.d_bn3(conv2d(h2, self.df_dim*8, name='d_h3_conv')))
-        h4 = linear(tf.reshape(h3, [self.batch_size, -1]), 1, 'd_h4_lin')
+	h3 = tf.concat([h3,z],3)
+	h4 = linear(tf.reshape(h3, [self.batch_size, -1]), 1, 'd_h4_lin')	
 
         return tf.nn.sigmoid(h4), h4
       else:
